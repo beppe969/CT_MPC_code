@@ -12,7 +12,7 @@ baseline in the style of recent conformal SMPC methods.
 
 Run from the package root with
 
-    python code/run_ctmpc_experiments.py
+    python CT_MPC_code/run_ctmpc_experiments.py
 
 Outputs are written to ./figures and ./results by default.
 """
@@ -20,12 +20,25 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import subprocess
 import sys
 from shlex import quote as shlex_quote
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+
+# Avoid BLAS/OpenMP oversubscription when the script is launched from CI or from
+# multiple subprocess workers.  The problem sizes here are small, and a single
+# numerical thread gives the most predictable runtime.
+for _thread_var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
+    os.environ.setdefault(_thread_var, "1")
 
 import numpy as np
 import pandas as pd
@@ -910,6 +923,30 @@ def plot_closed_loop_bands(summary_by_method: Dict[str, List[np.ndarray]], out_p
     plt.close(fig)
 
 
+# ---------------------------- manifest helper ----------------------------
+def write_reproducibility_manifest(results_dir: Path, quick: bool = False) -> None:
+    """Write deterministic settings used by the linear numerical study."""
+    N_tune = 2500 if not quick else 800
+    N_cal = 2500 if not quick else 800
+    N_test = 80000 if not quick else 20000
+    collective_discards = DEFAULT_COLLECTIVE_DISCARDS if not quick else 32
+    collective_level = 1.0 - collective_discards / N_cal
+    num_rollouts = 40 if not quick else 5
+    manifest = pd.DataFrame([
+        {"quantity": "N_tune", "value": N_tune},
+        {"quantity": "N_cal", "value": N_cal},
+        {"quantity": "N_test", "value": N_test},
+        {"quantity": "eps", "value": 0.05},
+        {"quantity": "collective_level", "value": collective_level},
+        {"quantity": "collective_discards", "value": collective_discards},
+        {"quantity": "collective_support_size", "value": collective_discards + 1},
+        {"quantity": "horizon", "value": H},
+        {"quantity": "closed_loop_rollouts", "value": num_rollouts},
+        {"quantity": "closed_loop_steps", "value": 35},
+    ])
+    manifest.to_csv(results_dir / "linear_reproducibility_manifest.csv", index=False)
+
+
 # ------------------------------- main ---------------------------------
 def run_experiments(out_dir: Path, quick: bool = False, calibration_only: bool = False) -> None:
     figures_dir = out_dir / "figures"
@@ -1103,19 +1140,7 @@ def run_experiments(out_dir: Path, quick: bool = False, calibration_only: bool =
     plot_closed_loop_phase(saved_traj, figures_dir / "closed_loop_phase.pdf")
 
     # Minimal machine-readable reproducibility manifest.
-    manifest = pd.DataFrame([
-        {"quantity": "N_tune", "value": N_tune},
-        {"quantity": "N_cal", "value": N_cal},
-        {"quantity": "N_test", "value": N_test},
-        {"quantity": "eps", "value": eps},
-        {"quantity": "collective_level", "value": collective_level},
-        {"quantity": "collective_discards", "value": collective_discards},
-        {"quantity": "collective_support_size", "value": collective_discards + 1},
-        {"quantity": "horizon", "value": H},
-        {"quantity": "closed_loop_rollouts", "value": num_rollouts},
-        {"quantity": "closed_loop_steps", "value": T},
-    ])
-    manifest.to_csv(results_dir / "linear_reproducibility_manifest.csv", index=False)
+    write_reproducibility_manifest(results_dir, quick=quick)
 
     # Print compact summaries for command-line reproducibility.
     print("Open-loop sweep:")
@@ -1133,7 +1158,7 @@ def _load_mpc_tubes(results_dir: Path) -> Dict[str, np.ndarray]:
     if not tube_file.exists():
         raise FileNotFoundError(
             f"{tube_file} not found. Run the calibration stage first, e.g. "
-            "python code/run_ctmpc_experiments.py --stage calibration"
+            "python CT_MPC_code/run_ctmpc_experiments.py --stage calibration"
         )
     data = np.load(tube_file)
     return {method: data[f"mpc_{method}"] for method in METHOD_ORDER}
@@ -1199,25 +1224,22 @@ def run_closed_loop_stage(out_dir: Path, quick: bool = False) -> None:
     for method in METHOD_ORDER:
         this_num = num_rollouts if method != "robust" else (20 if not quick else num_rollouts)
         tasks.append((method, mpc_tubes_at_085[method], rho_cl, x_initial, T, this_num, 9000))
-    if quick:
-        for method, tube, rho, x0, steps, runs, seed0 in tasks:
-            df, traj_x, traj_u = rollout_closed_loop(
-                solver,
-                tube,
-                rho=rho,
-                x_initial=x0,
-                T=steps,
-                num_rollouts=runs,
-                seed0=seed0,
-            )
-            df.insert(0, "method", method)
-            closed_rows.append(df)
-            saved_traj[method] = traj_x
-    else:
-        worker_dir = results_dir / "_worker_outputs"
-        for method, df, traj_x in _run_closed_loop_parallel_subprocess(tasks, worker_dir):
-            closed_rows.append(df)
-            saved_traj[method] = traj_x
+    # Run methods sequentially by default.  This is faster and more reliable on
+    # shared machines than launching several SciPy/HiGHS workers at once, because
+    # parallel BLAS oversubscription can otherwise dominate these small LPs.
+    for method, tube, rho, x0, steps, runs, seed0 in tasks:
+        df, traj_x, traj_u = rollout_closed_loop(
+            solver,
+            tube,
+            rho=rho,
+            x_initial=x0,
+            T=steps,
+            num_rollouts=runs,
+            seed0=seed0,
+        )
+        df.insert(0, "method", method)
+        closed_rows.append(df)
+        saved_traj[method] = traj_x
 
     closed_df = pd.concat(closed_rows, ignore_index=True)
     closed_df.to_csv(results_dir / "closed_loop_rollouts.csv", index=False)
@@ -1234,6 +1256,7 @@ def run_closed_loop_stage(out_dir: Path, quick: bool = False) -> None:
     coll_cost = float(closed_summary.loc[closed_summary["method"] == "collective", "mean_cost"].iloc[0])
     closed_summary["cost_increase_vs_collective_pct"] = 100.0 * (closed_summary["mean_cost"] / coll_cost - 1.0)
     closed_summary.to_csv(results_dir / "closed_loop_summary.csv", index=False)
+    write_reproducibility_manifest(results_dir, quick=quick)
     plot_closed_loop_phase(saved_traj, figures_dir / "closed_loop_phase.pdf")
     print("Closed-loop summary:")
     print(closed_summary)
@@ -1281,3 +1304,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Some SciPy/HiGHS builds can leave non-daemon numerical worker threads
+    # alive after all computations are finished.  Flush streams and terminate the
+    # CLI process explicitly so reproducibility drivers and CI jobs do not hang
+    # after the requested files have been written.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

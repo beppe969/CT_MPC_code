@@ -3,27 +3,27 @@
 Install dependencies from the package root:
 
 ```bash
-pip install -r code/requirements.txt
+pip install -r CT_MPC_code/requirements.txt
 ```
 
 Run a quick smoke test without overwriting the paper outputs:
 
 ```bash
-python code/run_all_experiments.py --quick
+python CT_MPC_code/run_all_experiments.py --quick
 ```
 
 Run the full linear study used in the paper:
 
 ```bash
-python code/run_all_experiments.py
+python CT_MPC_code/run_all_experiments.py
 ```
 
-The full driver executes three fresh stages (`calibration`, `grid`, and `closed-loop`) to avoid platform-dependent stalls after many sequential HiGHS LP solves.  The same stages can be run one at a time:
+The full driver executes three stages (`calibration`, `grid`, and `closed-loop`).  The same stages can be run one at a time:
 
 ```bash
-python code/run_ctmpc_experiments.py --stage calibration
-python code/run_ctmpc_experiments.py --stage grid
-python code/run_ctmpc_experiments.py --stage closed-loop
+python CT_MPC_code/run_ctmpc_experiments.py --stage calibration
+python CT_MPC_code/run_ctmpc_experiments.py --stage grid
+python CT_MPC_code/run_ctmpc_experiments.py --stage closed-loop
 ```
 
 ## Main paper script
